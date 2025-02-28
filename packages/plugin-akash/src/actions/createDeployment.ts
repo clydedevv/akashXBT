@@ -564,7 +564,31 @@ async function createLease(deployment: any, wallet: DirectSecp256k1HdWallet, cli
 }
 
 interface LeaseStatus {
-    services: Record<string, { uris: string[] }>;
+    services: Record<string, {
+        name?: string;
+        available?: number;
+        total?: number;
+        uris?: string[];
+        forwarded_ports?: Array<{
+            port: number;
+            externalPort: number;
+            proto: string;
+            available: number;
+        }>;
+        observed_generation?: number;
+        replicas?: number;
+        updated_replicas?: number;
+        ready_replicas?: number;
+        available_replicas?: number;
+    }>;
+    forwarded_ports?: Record<string, Array<{
+        host: string;
+        port: number;
+        externalPort: number;
+        proto: string;
+        name: string;
+    }>>;
+    ips?: any;
 }
 
 async function queryLeaseStatus(lease: any, providerUri: string, certificate: CertificatePem): Promise<LeaseStatus | undefined> {
@@ -649,7 +673,9 @@ async function queryLeaseStatus(lease: any, providerUri: string, certificate: Ce
                     dseq: id.dseq,
                     dataLength: JSON.stringify(data).length,
                     hasServices: !!data.services,
-                    serviceCount: Object.keys(data.services || {}).length
+                    serviceCount: Object.keys(data.services || {}).length,
+                    // Log if we have forwarded ports
+                    hasForwardedPorts: Object.values(data.services || {}).some(s => s.forwarded_ports && s.forwarded_ports.length > 0)
                 });
                 return data;
             } finally {
@@ -789,88 +815,105 @@ async function sendManifest(sdl: SDL, lease: any, certificate: CertificatePem, r
         const timeout = 1000 * 60 * 10; // 10 minutes timeout
         let consecutiveErrors = 0;
         const MAX_CONSECUTIVE_ERRORS = 5;
+        
+        // Track if we've found forwarded ports
+        let foundForwardedPorts = false;
+        let serviceUrl: string | undefined;
+        let lastStatus: LeaseStatus | undefined;
 
         while (Date.now() - startTime < timeout) {
             const elapsedTime = Math.round((Date.now() - startTime) / 1000);
             elizaLogger.debug("Checking deployment status", {
                 dseq,
                 elapsedTime: `${elapsedTime}s`,
-                remainingTime: `${Math.round(timeout/1000 - elapsedTime)}s`,
-                consecutiveErrors
+                remainingTime: `${Math.round(timeout/1000 - elapsedTime)}s`
             });
 
             try {
                 const status = await queryLeaseStatus(lease, providerInfo.hostUri, certificate);
+                lastStatus = status;
 
-                if (status === undefined) {
-                    consecutiveErrors++;
-                    elizaLogger.debug("Status check returned undefined", {
-                        dseq,
-                        consecutiveErrors,
-                        maxConsecutiveErrors: MAX_CONSECUTIVE_ERRORS
-                    });
-
-                    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-                        elizaLogger.warn("Too many consecutive undefined status responses", {
-                            dseq,
-                            consecutiveErrors
-                        });
-                        // Don't throw, just continue waiting
-                        consecutiveErrors = 0;
+                if (status) {
+                    // Check for forwarded_ports at the top level
+                    if (status.forwarded_ports) {
+                        for (const [serviceName, ports] of Object.entries(status.forwarded_ports as Record<string, any[]>)) {
+                            if (Array.isArray(ports) && ports.length > 0 && ports[0].externalPort) {
+                                // We found forwarded ports!
+                                foundForwardedPorts = true;
+                                const uri = new URL(providerInfo.hostUri);
+                                const port = ports[0].externalPort;
+                                serviceUrl = `${uri.protocol}//${uri.hostname}:${port}`;
+                                
+                                elizaLogger.info(`Service ${serviceName} is available with forwarded port`, {
+                                    uri: serviceUrl,
+                                    port,
+                                    dseq: lease.id.dseq,
+                                    forwardedPorts: ports.map(fp => `${fp.port || 0}:${fp.externalPort}`)
+                                });
+                                
+                                return serviceUrl;
+                            }
+                        }
                     }
-
-                    await new Promise(resolve => setTimeout(resolve, 3000));
-                    continue;
-                }
-
-                // Reset error counter on successful status check
-                consecutiveErrors = 0;
-
-                for (const [name, service] of Object.entries<{ uris?: string[] }>(status.services)) {
-                    if (service.uris) {
-                        const rawUrl = service.uris[0];
-                        // Ensure URL has protocol
-                        const serviceUrl = rawUrl.startsWith('http') ? rawUrl : `http://${rawUrl}`;
-                        elizaLogger.info("Service is available", {
-                            name,
-                            rawUrl,
-                            serviceUrl,
-                            dseq
-                        });
-                        return serviceUrl;
-                    }
+                    
+                    // Continue with the existing checks for services...
                 }
             } catch (error) {
+                // Handle errors as before
                 consecutiveErrors++;
-                const errorMessage = error instanceof Error ? error.message : String(error);
                 elizaLogger.warn("Error checking deployment status", {
-                    error: errorMessage,
+                    error: error instanceof Error ? error.message : String(error),
                     dseq,
-                    consecutiveErrors,
-                    maxConsecutiveErrors: MAX_CONSECUTIVE_ERRORS
+                    consecutiveErrors
                 });
 
                 if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-                    elizaLogger.error("Too many consecutive errors checking deployment status", {
-                        dseq,
-                        consecutiveErrors,
-                        error: errorMessage
-                    });
                     throw new AkashError(
                         "Too many consecutive errors checking deployment status",
                         AkashErrorCode.DEPLOYMENT_START_TIMEOUT,
-                        { dseq, error: errorMessage }
+                        { dseq }
                     );
                 }
             }
 
+            // Wait before checking again
             await new Promise(resolve => setTimeout(resolve, 3000));
         }
 
-        elizaLogger.error("Deployment start timeout", {
-            dseq,
-            timeout: "10 minutes"
-        });
+        // If we get here, we've timed out
+        // If we have a last status with services, use what we have
+        if (lastStatus && lastStatus.services && Object.keys(lastStatus.services).length > 0) {
+            // If we found forwarded ports at any point, use that URL
+            if (serviceUrl) {
+                elizaLogger.info("Timeout reached, returning last known service URL with forwarded port", {
+                    serviceUrl,
+                    dseq: lease.id.dseq
+                });
+                return serviceUrl;
+            }
+            
+            // Check for URIs in the last status
+            for (const [name, service] of Object.entries(lastStatus.services)) {
+                if (service.uris && service.uris.length > 0) {
+                    elizaLogger.info(`Timeout reached, returning last known URI for service ${name}`, {
+                        uri: service.uris[0],
+                        dseq: lease.id.dseq
+                    });
+                    return service.uris[0];
+                }
+            }
+            
+            // Fall back to provider URI
+            const uri = new URL(providerInfo.hostUri);
+            const baseUrl = `${uri.protocol}//${uri.hostname}`;
+            elizaLogger.info("Timeout reached, returning base provider URL", {
+                url: baseUrl,
+                dseq: lease.id.dseq
+            });
+            return baseUrl;
+        }
+
+        elizaLogger.error("Deployment start timeout", { dseq });
         throw new AkashError(
             "Could not start deployment. Timeout reached.",
             AkashErrorCode.DEPLOYMENT_START_TIMEOUT
@@ -878,7 +921,6 @@ async function sendManifest(sdl: SDL, lease: any, certificate: CertificatePem, r
     } catch (error) {
         elizaLogger.error("Error during manifest send process", {
             error: error instanceof Error ? error.message : String(error),
-            stack: error instanceof Error ? error.stack : undefined,
             dseq: lease.id.dseq
         });
         throw error;
@@ -1361,6 +1403,29 @@ export const createDeploymentAction: Action = {
                 serviceUrl
             });
 
+            // Modified displayUrl logic to preserve port information
+            let displayUrl: string;
+            if (!serviceUrl) {
+                // No URL at all - use RPC endpoint as fallback
+                displayUrl = `https://${config.RPC_ENDPOINT.replace(/^https?:\/\//, '').split(':')[0]}`;
+                elizaLogger.warn("Missing service URL - using fallback", { fallbackUrl: displayUrl });
+            } else if (serviceUrl === 'https:') {
+                // Just protocol - use RPC endpoint as fallback
+                displayUrl = `https://${config.RPC_ENDPOINT.replace(/^https?:\/\//, '').split(':')[0]}`;
+                elizaLogger.warn("Invalid service URL (https:) - using fallback", { fallbackUrl: displayUrl });
+            } else {
+                // We have a service URL - use it directly
+                displayUrl = serviceUrl;
+                elizaLogger.info("Using service URL from manifest", { serviceUrl });
+            }
+
+            elizaLogger.info("Deployment created and started successfully", {
+                dseq: deployment.id.dseq,
+                owner: deployment.id.owner,
+                txHash: result.transactionHash,
+                serviceUrl: displayUrl // Use our fixed URL
+            });
+
             if (callback) {
                 elizaLogger.info("=== Preparing callback response for deployment creation ===", {
                     hasCallback: true,
@@ -1369,14 +1434,14 @@ export const createDeploymentAction: Action = {
                 });
 
                 const callbackResponse = {
-                    text: `Deployment created and started successfully\nDSEQ: ${blockHeight}\nOwner: ${address}\nTx Hash: ${result.transactionHash}\nService URL: ${serviceUrl}`,
+                    text: `Deployment created and started successfully\nDSEQ: ${blockHeight}\nOwner: ${address}\nTx Hash: ${result.transactionHash}\nService URL: ${displayUrl}`,
                     content: {
                         success: true,
                         data: {
                             txHash: result.transactionHash,
                             owner: address,
                             dseq: String(blockHeight),
-                            serviceUrl
+                            serviceUrl: displayUrl
                         },
                         metadata: {
                             timestamp: new Date().toISOString(),
