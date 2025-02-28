@@ -99,7 +99,7 @@ if (AKASH_SPASH) {
   }
 
   const akashPlugin: Plugin = {
-    name: "plugin-akash",
+    name: "akash",
     description: "Akash Network Plugin for deploying and managing cloud compute",
     actions: actions,
     evaluators: []
